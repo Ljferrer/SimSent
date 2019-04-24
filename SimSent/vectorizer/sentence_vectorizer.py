@@ -1,25 +1,31 @@
+import gc
 import os
 import os.path as p
 import json
 import requests
 from tqdm import tqdm
-from typing import List, Union
+from pathlib import Path
+from typing import List, Tuple, Union
 
 import numpy as np
 import tensorflow as tf
 import tensorflow_hub as hub
-
 from .base_vectorizer import BaseVectorizer
+
+tf.logging.set_verbosity(tf.logging.ERROR)
+
+__all__ = ['DockerVectorizer', 'SentenceVectorizer']
 
 
 #### Query Vectorization ####
 class DockerVectorizer(BaseVectorizer):
-    """
-    Intended for fast Query Vectorization.
+    """ Intended for online query vectorization.
     Note: Ensure docker container is running before importing class.
     """
+    DOCKER_EMB = List[List[np.float32]]
+
     def __init__(self, large: bool = False, model_name: str = None):
-        BaseVectorizer.__init__(self)
+        super().__init__()
 
         if not model_name and large:
             model_name = 'USE-large-v3'
@@ -28,7 +34,7 @@ class DockerVectorizer(BaseVectorizer):
             model_name = 'USE-lite-v2'
         self.url = f'http://localhost:8501/v1/models/{model_name}:predict'
 
-    def make_vectors(self, query: Union[str, List[str]]):
+    def make_vectors(self, query: Union[str, List[str]]) -> DOCKER_EMB:
         """ Takes one query """
         if not isinstance(query, list):
             query = [str(query)]
@@ -46,11 +52,14 @@ class DockerVectorizer(BaseVectorizer):
 
 #### Corpus Vectorization ####
 class SentenceVectorizer(BaseVectorizer):
-    """
-    Intended for batch Corpus Vectorization
-    """
-    def __init__(self, large: bool = False, path_to_model: str = None):
-        BaseVectorizer.__init__(self)
+    """ Intended for batch vectorization of a large text corpus """
+    ID_BATCH = List[int]
+    SENT_BATCH = List[str]
+    GEN_BATCH = Tuple[ID_BATCH, SENT_BATCH]
+    EMB_BATCH = List[tf.Tensor]
+
+    def __init__(self, large: bool = False, path_to_model: Path = None):
+        super().__init__()
 
         model_parent_dir = p.abspath(p.join(p.dirname(__file__), 'model/'))
         if large:
@@ -73,7 +82,7 @@ class SentenceVectorizer(BaseVectorizer):
 
         self.graph = None
         self.model = None
-        self.session = None
+        self.sess = None
         print(f'Loading model: {self.path_to_model}')
         self.define_graph()
         print('Initializing TF Session...')
@@ -85,81 +94,100 @@ class SentenceVectorizer(BaseVectorizer):
             self.model = hub.Module(self.path_to_model)
 
     def start_session(self):
-        self.session = tf.Session()
+        self.sess = tf.Session()
         with self.graph.as_default():
-            self.session.run([tf.global_variables_initializer(), tf.tables_initializer()])
+            self.sess.run([tf.global_variables_initializer(),
+                           tf.tables_initializer()])
 
     def close_session(self):
-        self.session.close()
+        self.sess.close()
         tf.reset_default_graph()
         self.define_graph()
 
-    def make_vectors(self, sentences: List[str], n_minibatch: int = 512) -> List[tf.Tensor]:
+    @staticmethod
+    def batch_generator(id_sent_tsv: Path,
+                        batch_size: int = 128 * 128) -> GEN_BATCH:
+        """ Generator for tf.data.Dataset object """
+        ids = list()
+        sents = list()
+        with open(p.abspath(id_sent_tsv)) as tsv:
+            for line in tsv:
+                sent_id, sent_text = str(line).replace('\n', '').split('\t')
+                ids.append(int(sent_id)), sents.append(str(sent_text))
 
+        print(f'Vectorizing {len(sents)} sentences... ')
+        while len(sents):
+            yield (list(ids[:batch_size]), list(sents[:batch_size]))
+            ids, sents = list(ids[batch_size:]), list(sents[batch_size:])
+            gc.collect()
+
+    def make_vectors(self, sents: List[str],
+                     minibatch_size: int = 128) -> EMB_BATCH:
+        """ High throughput, GPU-friendly vectorization """
         embeddings = list()
         batched_tensors = list()
         with self.graph.as_default():
+
             # High throughput vectorization (fast)
-            if len(sentences) > n_minibatch:
-                while len(sentences) >= n_minibatch:
-                    batch = list(sentences[:n_minibatch])
-                    sentences = list(sentences[n_minibatch:])
+            if len(sents) > minibatch_size:
+                while len(sents) >= minibatch_size:
+                    batch = list(sents[:minibatch_size])
+                    sents = list(sents[minibatch_size:])
                     batched_tensors.append(tf.constant(batch, dtype=tf.string))
 
                 dataset = tf.data.Dataset.from_tensor_slices(batched_tensors)
                 dataset = dataset.make_one_shot_iterator()
                 make_embeddings = self.model(dataset.get_next())
-
                 while True:
                     try:
-                        embeddings.append(self.session.run(make_embeddings))
+                        embeddings.append(self.sess.run(make_embeddings))
                     except tf.errors.OutOfRangeError:
                         break
 
             # Tail end vectorization (slow)
-            if len(sentences):
-                basic_batch = self.model(sentences)
-                embeddings.append(self.session.run(basic_batch))
+            if len(sents):
+                basic_batch = self.model(sents)
+                embeddings.append(self.sess.run(basic_batch))
 
         return embeddings
 
-    @staticmethod
-    def batch_generator(id_sent_tsv, batch_size: int = -1):
-        ids = list()
-        sents = list()
-        with open(id_sent_tsv) as tsv:
-            for line in tsv:
-                sent_id, sent_text = line.split('\t')
-                ids.append(sent_id), sents.append(sent_text)
+    def prep_npz(self, input_tsv: Path, output_npz: Path,
+                 batch_size: int = 512 * 128, minibatch_size: int = 128):
+        """
+        Vectorizes sentences and saves id into a numpy disk array.
+        Avoids redundant computation if index must be rebuilt.
 
-        while len(ids):
-            yield list(ids[:batch_size]), list(sents[:batch_size])
-            ids = list(ids[batch_size:])
-            sents = list(sent_text[batch_size:])
+        :param input_tsv: Path to input file.tsv
+                * Format:   int(ID)     "sentence"
 
-    def prep_npz(self, id_sent_tsv, id_sent_npz,
-                 batch_size: int = 512*128, minibatch_size: int = 512):
+        :param output_npz: Path to output file.npz
+                * Items:    ['ids']     int         (n, )
+                            ['sents']   str         (n, )
+                            ['embs']    float32     (n, 512)
 
+        :param batch_size: N sent yielded by batch_generator
+        :param minibatch_size: batch_size % minibatch_size should be 0
+
+        Writes file to path: output_npz
+        """
         all_ids, all_sents, all_embs = list(), list(), list()
 
-        batch_gen = self.batch_generator(id_sent_tsv, batch_size)
+        batch_gen = self.batch_generator(input_tsv, batch_size=batch_size)
         for id_batch, sent_batch in tqdm(batch_gen):
-            embs = self.make_vectors(sent_batch, minibatch_size)
+            embs = self.make_vectors(sent_batch, minibatch_size=minibatch_size)
 
             id_batch = np.array(id_batch, dtype=np.int64)
-            sent_batch = np.array(sent_batch, dtype=np.str)
             emb_batch = np.vstack(embs).astype(np.float32)
+            sent_batch = np.array(sent_batch, dtype=np.str)
 
             all_ids.append(id_batch)
-            all_sents.append(sent_batch)
             all_embs.append(emb_batch)
+            all_sents.append(sent_batch)
 
-        all_ids = np.vstack(all_ids)
-        all_sents = np.vstack(all_sents)
-        all_embs = np.vstack(all_embs)
+        all_ids = np.concatenate(all_ids, axis=None)
+        all_embs = np.concatenate(all_embs, axis=0)
+        all_sents = np.concatenate(all_sents, axis=None)
 
-        np.savez(id_sent_npz,
-                 ids=all_ids, sents=all_sents, embs=all_embs,
+        np.savez(output_npz,
+                 ids=all_ids, embs=all_embs, sents=all_sents,
                  compressed=True)
-
-
