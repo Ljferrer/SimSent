@@ -3,7 +3,6 @@ import os
 import os.path as p
 import json
 import requests
-from tqdm import tqdm
 from pathlib import Path
 from typing import List, Tuple, Union
 
@@ -115,7 +114,6 @@ class SentenceVectorizer(BaseVectorizer):
                 sent_id, sent_text = str(line).replace('\n', '').split('\t')
                 ids.append(int(sent_id)), sents.append(str(sent_text))
 
-        print(f'Vectorizing {len(sents)} sentences... ')
         while len(sents):
             yield (list(ids[:batch_size]), list(sents[:batch_size]))
             ids, sents = list(ids[batch_size:]), list(sents[batch_size:])
@@ -173,7 +171,7 @@ class SentenceVectorizer(BaseVectorizer):
         all_ids, all_sents, all_embs = list(), list(), list()
 
         batch_gen = self.batch_generator(input_tsv, batch_size=batch_size)
-        for id_batch, sent_batch in tqdm(batch_gen):
+        for id_batch, sent_batch in batch_gen:
             embs = self.make_vectors(sent_batch, minibatch_size=minibatch_size)
 
             id_batch = np.array(id_batch, dtype=np.int64)
