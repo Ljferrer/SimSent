@@ -8,6 +8,8 @@ from typing import Dict, List, Tuple, Union
 import numpy as np
 
 from SimSent.indexer.faiss_cache import faiss_cache
+from SimSent.indexer.base_handler import BaseIndexHandler as IndexHandler
+from SimSent.vectorizer.base_vectorizer import BaseVectorizer as Vectorizer
 
 __all__ = ['QueryHandler']
 
@@ -20,15 +22,15 @@ class QueryHandler:
     FormattedSearch = List[Tuple[np.int64, np.float32, str]]
     FormattedMultiSearch = Dict[str, FormattedSearch]
 
-    def __init__(self, query_vectorizer: object, index_handler: object,
-                 project_dir: Path, nested: bool = False):
+    def __init__(self, query_vectorizer: Vectorizer, index_handler: IndexHandler,
+                 project_dir: Path, get_nested: bool = False):
         super().__init__()
         self.vectorizer = query_vectorizer
         self.indexer = index_handler
 
         # Get id-to-sent maps
-        get = '*/*.sqlite' if nested else '*.sqlite'
-        db_files = glob.glob(p.abspath(project_dir / get))
+        get = '*/*.sqlite' if get_nested else '*.sqlite'
+        db_files = glob.glob(p.abspath(project_dir/get))
         self.sent_dbs = dict()
         for f in db_files:
             self.sent_dbs[Path(f).stem] = SqliteDict(f)
@@ -86,8 +88,9 @@ class QueryHandler:
     def format_results(self, source: str, result_set: FaissSearch, k: int
                        ) -> FormattedSearch:
         scores, hit_ids = result_set
+        scores, hit_ids = scores[:k], hit_ids[:k]       # Only get k sentences
         sents = list()
         for sent_id in hit_ids:
             sents.append(self.sent_dbs[source][str(sent_id)])
 
-        return sorted(zip(scores, hit_ids, sents))[:k]
+        return sorted(zip(scores, hit_ids, sents))
