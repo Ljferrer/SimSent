@@ -72,9 +72,11 @@ SERVE_PATH = p.abspath(p.join(p.dirname(__file__),
 # Build MetaGraph
 # TODO: Make metagraph with both models
 with tf.Graph().as_default():
-    module = hub.Module(MODEL_LINK, name=MODEL_NAME)
-    text = tf.placeholder(tf.string, shape=[None], name='text')
-    embedding = module(text)
+    
+    with tf.device('/cpu:0'):
+        module = hub.Module(MODEL_LINK, name=MODEL_NAME)
+        text = tf.placeholder(tf.string, shape=[None], name='text')
+        embedding = module(text)
 
     init_op = tf.group([tf.global_variables_initializer(),
                         tf.tables_initializer()])
