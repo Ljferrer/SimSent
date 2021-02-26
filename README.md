@@ -19,10 +19,13 @@ From there, SimSent creates a searchable faiss index that you can build, rebuild
 ## Performance 
 Although I have not included any formal analysis that compares SimSent to other out-of-the-box text search solutions, it anecdotally has performed much better than TF-IDF.
 
-## Virtual Environment
-#### Initialize:
+# Usage
+## Environment Initialization
 ```bash
 conda env create .
 source activate SimSent
 ipython kernel install --user --name=SimSent
 ```
+
+## Example
+Check out the [FullDemo.ipynb](https://github.com/Ljferrer/SimSent/blob/master/FullDemo.ipynb) to see a simple example of SimSent's usage, from ETL pipeline to search results. 
